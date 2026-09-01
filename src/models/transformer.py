@@ -197,6 +197,25 @@ class Seq2SeqTransformer(nn.Module):
         self.decoder = Decoder(cfg, rope)
         self.pad_id, self.bos_id, self.eos_id = cfg.pad_id, cfg.bos_id, cfg.eos_id
 
+        # --- weight init ---
+        # Linears: xavier_uniform. Embeddings: N(0, d_model^-0.5) so that after
+        # the forward's *sqrt(d_model) scale they have std ~1, on par with the
+        # O(1) sinusoidal PE (Vaswani convention). Without this, tied-embedding
+        # logits blow up and the untrained loss is ~vocab, not ~ln(vocab).
+        self.apply(self._init_linear)
+        for emb in (self.encoder.embed, self.decoder.embed):
+            nn.init.normal_(emb.weight, std=cfg.d_model ** -0.5)
+            with torch.no_grad():
+                emb.weight[cfg.pad_id].zero_()
+        self.decoder.out_proj.weight = self.decoder.embed.weight   # keep tied
+
+    @staticmethod
+    def _init_linear(m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
     # --- masks: bool, broadcastable to (B, H, Tq, Tk), True = "may attend".
     #     Kept here for a self-contained module; could move to utils.py. ---
     def _pad_mask(self, ids: torch.Tensor) -> torch.Tensor:

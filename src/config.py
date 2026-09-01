@@ -42,7 +42,7 @@ class Config:
     dropout: float = 0.1
 
     # --- tokenizer / sequence (shared) ---
-    src_merge_ops: int = 6000            # bit-level BPE on the cipher
+    src_merge_ops: int = 3000            # byte-level BPE on the cipher (see dataset.py header)
     tgt_merge_ops: int = 4000            # word-level BPE on the plaintext
     patch_size: int = 4                  # BLT only (C5): bytes per patch
     max_src_len: int = 1536             # caps; tune from dataset.py length report.
@@ -80,7 +80,7 @@ class Config:
     plain_file: str = "brown_plain.txt"
     n_val: int = 250
     n_test: int = 250
-    num_workers: int = 2
+    num_workers: int = 0        # dataset is small and in-memory; workers = pure overhead
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
     tokenizer_dir: str = "tokenizers"
