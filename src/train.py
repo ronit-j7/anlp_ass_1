@@ -116,7 +116,8 @@ def main() -> None:
     scheduler = build_scheduler(optimizer, cfg)
     criterion = nn.CrossEntropyLoss(ignore_index=cfg.pad_id,
                                     label_smoothing=cfg.label_smoothing)
-    use_amp = cfg.bf16 and device == "cuda"
+    # bf16 only where the GPU supports it natively (Ampere+); T4/Turing -> fp32
+    use_amp = cfg.bf16 and device == "cuda" and torch.cuda.is_bf16_supported()
 
     run = None
     if wandb is not None and not args.no_wandb:

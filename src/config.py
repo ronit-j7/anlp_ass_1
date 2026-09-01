@@ -45,8 +45,9 @@ class Config:
     src_merge_ops: int = 3000            # byte-level BPE on the cipher (see dataset.py header)
     tgt_merge_ops: int = 4000            # word-level BPE on the plaintext
     patch_size: int = 4                  # BLT only (C5): bytes per patch
-    max_src_len: int = 1536             # caps; tune from dataset.py length report.
-    max_tgt_len: int = 512             # over-cap lines: dropped in train, truncated in eval
+    max_src_len: int = 1536             # src token p100=1164 -> nothing dropped
+    max_tgt_len: int = 768             # covers tgt p99=693 (~1% of train dropped); over-cap
+                                        # lines are dropped in train, truncated in eval
     src_vocab_size: Optional[int] = None
     tgt_vocab_size: Optional[int] = None
     pad_id: int = PAD_ID
