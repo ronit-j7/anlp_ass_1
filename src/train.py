@@ -23,7 +23,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .config import get_config
-from .dataset import collate_seq2seq, make_datasets
+from .dataset import TokenBudgetSampler, collate_seq2seq, make_datasets
 from .models.transformer import Seq2SeqTransformer
 from .utils import (
     build_scheduler,
@@ -99,12 +99,16 @@ def main() -> None:
     train_ds, val_ds, test_ds, src_tok, tgt_tok = make_datasets(cfg)
     cfg = replace(cfg, src_vocab_size=src_tok.vocab_size, tgt_vocab_size=tgt_tok.vocab_size)
 
-    g = torch.Generator().manual_seed(cfg.seed)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              collate_fn=collate_seq2seq, generator=g,
-                              num_workers=cfg.num_workers, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                            collate_fn=collate_seq2seq)
+    def _lens(ds):
+        return [max(len(s), len(t)) for s, t in zip(ds.src_ids, ds.tgt_ids)]
+
+    train_sampler = TokenBudgetSampler(_lens(train_ds), cfg.max_tokens,
+                                       shuffle=True, seed=cfg.seed)
+    val_sampler = TokenBudgetSampler(_lens(val_ds), cfg.max_tokens, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_sampler=train_sampler,
+                              collate_fn=collate_seq2seq, num_workers=cfg.num_workers)
+    val_loader = DataLoader(val_ds, batch_sampler=val_sampler,
+                            collate_fn=collate_seq2seq, num_workers=cfg.num_workers)
 
     # --- model / optim ---
     model = Seq2SeqTransformer(cfg).to(device)
@@ -132,8 +136,11 @@ def main() -> None:
     step_ema = None
     reset_peak_gpu_mem(device)
     stop = False
+    epoch = 0
 
     while step < cfg.max_steps and not stop:
+        train_sampler.set_epoch(epoch)
+        epoch += 1
         for src, tgt in train_loader:
             model.train()
             src, tgt = src.to(device), tgt.to(device)
@@ -176,7 +183,8 @@ def main() -> None:
             if step % cfg.eval_every == 0 or step == cfg.max_steps:
                 vloss = val_loss(model, val_loader, criterion, device, cfg.tgt_vocab_size)
                 preds, refs = generate_predictions(model, val_ds, tgt_tok, cfg, device,
-                                                   subset=cfg.eval_subset)
+                                                   subset=cfg.eval_subset,
+                                                   max_len=cfg.eval_gen_max_len)
                 vm = compute_all_metrics(preds, refs, include_bleu_rouge=True)
                 history["val_loss"].append((step, vloss))
                 history["val_seq_acc"].append((step, vm["seq_acc"]))

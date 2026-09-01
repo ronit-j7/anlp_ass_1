@@ -56,7 +56,11 @@ class Config:
     unk_id: int = UNK_ID
 
     # --- optimization (shared) ---
-    batch_size: int = 32
+    batch_size: int = 32                # nominal; real batching is token-budget (see max_tokens)
+    max_tokens: int = 6144              # cap on (rows * padded_len) per train/val batch, so a
+                                        # long example -> fewer rows. Attention here is O(B*T^2)
+                                        # (no flash-attn), so this is what bounds GPU memory.
+    eval_batch_size: int = 16          # greedy decode is autoregressive; keep this modest
     lr: float = 3e-4                     # peak LR after warmup
     lr_schedule: str = "inverse_sqrt"   # "inverse_sqrt" | "cosine"
     warmup_steps: int = 500
@@ -70,8 +74,10 @@ class Config:
 
     # --- eval / logging (shared) ---
     eval_every: int = 500
-    eval_subset: int = 200              # greedy-decode this many val examples per eval
-    early_stop_patience: int = 6       # consecutive evals w/o val seq-acc gain
+    eval_subset: int = 128              # greedy-decode this many val examples per eval
+    eval_gen_max_len: int = 320        # cap decode length in PERIODIC eval (final test uses
+                                        # gen_max_len); greedy w/o KV cache is O(len^2)
+    early_stop_patience: int = 6       # consecutive evals w/o val gain (seq_acc, then loss)
     seed: int = 42
     wandb_project: str = "anlp-a1-transformers"
 

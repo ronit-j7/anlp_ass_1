@@ -355,6 +355,49 @@ class Seq2SeqDataset(Dataset):
         )
 
 
+class TokenBudgetSampler:
+    """Yields batches (lists of dataset indices) whose padded size --
+    n_rows * longest_seq_in_batch -- stays under `max_tokens`. Examples are
+    sorted by length so each batch is near-uniform (little wasted padding) and
+    a batch holding a long example simply gets fewer rows. This is what keeps
+    the O(batch * seq^2) attention from OOMing on the long-sequence tail.
+
+    Batch *order* is reshuffled every epoch (call set_epoch); the within-batch
+    grouping is fixed."""
+
+    def __init__(self, lengths: Sequence[int], max_tokens: int,
+                 shuffle: bool = True, seed: int = 0):
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+        self._batches: List[List[int]] = []
+        cur: List[int] = []
+        cur_max = 0
+        for i in order:
+            nmax = max(cur_max, lengths[i])
+            if cur and nmax * (len(cur) + 1) > max_tokens:
+                self._batches.append(cur)
+                cur, cur_max, nmax = [], 0, lengths[i]
+            cur.append(i)
+            cur_max = nmax
+        if cur:
+            self._batches.append(cur)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __iter__(self):
+        batches = list(self._batches)
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(batches)
+        yield from batches
+
+
 def collate_seq2seq(batch, pad_id: int = PAD_ID):
     """Pad a batch to its own max source / target length."""
     srcs, tgts = zip(*batch)

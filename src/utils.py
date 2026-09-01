@@ -173,11 +173,13 @@ def generate_predictions(
     device,
     subset: Optional[int] = None,
     batch_size: Optional[int] = None,
+    max_len: Optional[int] = None,
 ) -> Tuple[List[str], List[str]]:
     """Greedy-decode `subset` (or all) examples of `dataset`; return (preds, refs)."""
     model.eval()
     n = len(dataset) if subset is None else min(subset, len(dataset))
-    bs = batch_size or cfg.batch_size
+    bs = batch_size or getattr(cfg, "eval_batch_size", 16)
+    gen_len = max_len or cfg.gen_max_len
     preds: List[str] = []
     for start in range(0, n, bs):
         rows = list(range(start, min(start + bs, n)))
@@ -186,7 +188,7 @@ def generate_predictions(
         for b, i in enumerate(rows):
             ids = dataset.src_ids[i]
             src[b, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-        gen = model.generate(src.to(device), max_len=cfg.gen_max_len)  # (B, L)
+        gen = model.generate(src.to(device), max_len=gen_len)  # (B, L)
         for row in gen.tolist():
             body = cut_at_eos(row[1:], cfg.eos_id)  # drop BOS, stop at EOS
             preds.append(tgt_tok.decode(body))
