@@ -269,7 +269,8 @@ def build_scheduler(optimizer, cfg: Config):
         if step < warm:
             return step / warm
         prog = min((step - warm) / max(cfg.max_steps - warm, 1), 1.0)
-        return 0.5 * (1 + math.cos(math.pi * prog))
+        floor = getattr(cfg, "lr_min_ratio", 0.1)   # don't decay to 0 -- that froze C1
+        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * prog))
 
     fn = cosine if cfg.lr_schedule == "cosine" else inverse_sqrt
     return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)

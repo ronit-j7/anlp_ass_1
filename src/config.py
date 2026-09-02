@@ -34,11 +34,11 @@ class Config:
     tokenization: str = "subword"        # "subword" | "blt"
 
     # --- model width / depth (shared across all configs) ---
-    d_model: int = 192                   # a 1.6M model already fit the map; 4.5M has headroom
-    n_layers: int = 3                    # same count for encoder and decoder
-    n_heads: int = 6
+    d_model: int = 256                   # ~9M; generalizing the XOR+phase rule needs the capacity
+    n_layers: int = 4                    # same count for encoder and decoder
+    n_heads: int = 8
     n_kv_heads: int = 2                  # only consulted when attention == "gqa"
-    d_ff: int = 768
+    d_ff: int = 1024
     dropout: float = 0.1
 
     # --- tokenizer / sequence (shared) ---
@@ -68,14 +68,15 @@ class Config:
                                         # (no flash-attn), so this is what bounds GPU memory.
     eval_batch_size: int = 16          # greedy decode is autoregressive; keep this modest
     lr: float = 5e-4                     # peak LR after warmup
-    lr_schedule: str = "cosine"         # "cosine" | "inverse_sqrt"  (cosine holds LR high longer,
-                                        #   which the mapping needs to "click" -- see notes)
+    lr_schedule: str = "cosine"         # "cosine" | "inverse_sqrt"
+    lr_min_ratio: float = 0.1          # cosine floor: LR never drops below 10% of peak
     warmup_steps: int = 800
-    max_steps: int = 12000             # with phase-aligned chunking the click comes much sooner
-    min_steps: int = 3000              # early stopping cannot fire before this
+    max_steps: int = 12000             # C1 was still improving at 7k before the LR collapse
+    min_steps: int = 4000              # early stopping cannot fire before this
     weight_decay: float = 0.01
     grad_clip: float = 1.0
-    label_smoothing: float = 0.1
+    label_smoothing: float = 0.0       # deterministic exact-reconstruction task -> want the
+                                        # model fully confident; smoothing caps seq_acc
     adam_betas: Tuple[float, float] = (0.9, 0.98)
     adam_eps: float = 1e-9
     bf16: bool = True
