@@ -84,7 +84,7 @@ class Config:
     eval_every: int = 1000
     eval_subset: int = 128              # greedy-decode this many val chunks per eval
     eval_gen_max_len: int = 384        # chunks are short now, so decode them in full
-    early_stop_patience: int = 8       # consecutive evals w/o val gain (seq_acc, then loss)
+    early_stop_patience: int = 4       # consecutive evals w/o val gain (seq_acc, then loss)
     seed: int = 42
     wandb_project: str = "anlp-a1-transformers"
 

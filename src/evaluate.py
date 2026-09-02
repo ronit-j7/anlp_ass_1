@@ -45,11 +45,12 @@ def evaluate_one(name: str, split: str, ckpt_path: str, device_pref: str) -> dic
     cfg = Config(**ckpt["cfg"])
     set_seed(cfg.seed)
 
-    train_ds, val_ds, test_ds, _src_tok, tgt_tok = make_datasets(cfg)
+    train_ds, val_ds, test_ds, _src_tok, tgt_tok, extra = make_datasets(cfg)
     ds = {"train": train_ds, "val": val_ds, "test": test_ds}[split]
 
     is_blt = cfg.tokenization == "blt"
-    model = (ByteLatentTransformer(cfg) if is_blt else Seq2SeqTransformer(cfg)).to(device)
+    model = (ByteLatentTransformer(cfg, extra["src_ent"], extra["tgt_ent"])
+             if is_blt else Seq2SeqTransformer(cfg)).to(device)
     model.load_state_dict(ckpt["model"])
 
     reset_peak_gpu_mem(device)

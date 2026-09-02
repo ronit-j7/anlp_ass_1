@@ -186,18 +186,30 @@ def generate_predictions(
     bs = batch_size or getattr(cfg, "eval_batch_size", 16)
     gen_len = max_len or cfg.gen_max_len
     keep_space = reassemble
+    is_blt = getattr(cfg, "tokenization", "subword") == "blt"
+    blt_pad = 256
     chunks: List[str] = []
     for start in range(0, n, bs):
         rows = list(range(start, min(start + bs, n)))
+        pad = blt_pad if is_blt else cfg.pad_id
         smax = max(len(dataset.src_ids[i]) for i in rows)
-        src = torch.full((len(rows), smax), cfg.pad_id, dtype=torch.long)
+        src = torch.full((len(rows), smax), pad, dtype=torch.long)
         for b, i in enumerate(rows):
-            ids = dataset.src_ids[i]
-            src[b, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-        gen = model.generate(src.to(device), max_len=gen_len)  # (B, L)
-        for row in gen.tolist():
-            body = cut_at_eos(row[1:], cfg.eos_id)  # drop BOS, stop at EOS
-            chunks.append(tgt_tok.decode(body, strip=not keep_space))
+            src[b, : len(dataset.src_ids[i])] = torch.tensor(dataset.src_ids[i])
+
+        if is_blt:
+            nmax = max(len(dataset.src_plen[i]) for i in rows)
+            sp = torch.zeros(len(rows), nmax, dtype=torch.long)
+            for b, i in enumerate(rows):
+                sp[b, : len(dataset.src_plen[i])] = torch.tensor(dataset.src_plen[i])
+            gen = model.generate(src.to(device), sp.to(device), max_len=gen_len)
+            for row in gen.tolist():
+                chunks.append(tgt_tok.decode(row, strip=not keep_space))
+        else:
+            gen = model.generate(src.to(device), max_len=gen_len)
+            for row in gen.tolist():
+                body = cut_at_eos(row[1:], cfg.eos_id)  # drop BOS, stop at EOS
+                chunks.append(tgt_tok.decode(body, strip=not keep_space))
 
     if not reassemble:
         return chunks, [dataset.tgt_text[i] for i in range(n)]

@@ -58,24 +58,29 @@ def build_optimizer(model: nn.Module, cfg) -> torch.optim.Optimizer:
     )
 
 
-def compute_loss(model, src, tgt, criterion, is_blt: bool):
+def compute_loss(model, batch, criterion, is_blt: bool, device):
     """C1-C4: token-level teacher forcing. C5/BLT: model returns (byte_logits,
-    labels) already patch-aligned, so no shift here."""
+    labels) already patch-aligned (labels carry -100 on pad slots)."""
     if is_blt:
-        logits, labels = model(src, tgt)
+        src, tgt, sp, tp = (x.to(device) for x in batch)
+        logits, labels = model(src, tgt, sp, tp)
+        bsz = src.size(0)
     else:
+        src, tgt = (x.to(device) for x in batch)
         logits, labels = model(src, tgt[:, :-1]), tgt[:, 1:]
-    return criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+        bsz = src.size(0)
+    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+    return loss, bsz
 
 
 @torch.no_grad()
 def val_loss(model, loader, criterion, device, is_blt: bool) -> float:
     model.eval()
     tot, n = 0.0, 0
-    for src, tgt in loader:
-        src, tgt = src.to(device), tgt.to(device)
-        tot += compute_loss(model, src, tgt, criterion, is_blt).item() * src.size(0)
-        n += src.size(0)
+    for batch in loader:
+        loss, bsz = compute_loss(model, batch, criterion, is_blt, device)
+        tot += loss.item() * bsz
+        n += bsz
     return tot / max(n, 1)
 
 
@@ -103,31 +108,34 @@ def main() -> None:
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     # --- data + tokenizers (vocab sizes only known now) ---
-    train_ds, val_ds, test_ds, src_tok, tgt_tok = make_datasets(cfg)
+    is_blt = cfg.tokenization == "blt"
+    train_ds, val_ds, test_ds, src_tok, tgt_tok, extra = make_datasets(cfg)
     cfg = replace(cfg, src_vocab_size=src_tok.vocab_size, tgt_vocab_size=tgt_tok.vocab_size)
 
     def _lens(ds):
         return [max(len(s), len(t)) for s, t in zip(ds.src_ids, ds.tgt_ids)]
 
+    collate = collate_blt if is_blt else collate_seq2seq
     train_sampler = TokenBudgetSampler(_lens(train_ds), cfg.max_tokens,
                                        shuffle=True, seed=cfg.seed)
     val_sampler = TokenBudgetSampler(_lens(val_ds), cfg.max_tokens, shuffle=False)
     train_loader = DataLoader(train_ds, batch_sampler=train_sampler,
-                              collate_fn=collate_seq2seq, num_workers=cfg.num_workers)
+                              collate_fn=collate, num_workers=cfg.num_workers)
     val_loader = DataLoader(val_ds, batch_sampler=val_sampler,
-                            collate_fn=collate_seq2seq, num_workers=cfg.num_workers)
+                            collate_fn=collate, num_workers=cfg.num_workers)
 
     # --- model / optim ---
-    is_blt = cfg.tokenization == "blt"
-    model = (ByteLatentTransformer(cfg) if is_blt else Seq2SeqTransformer(cfg)).to(device)
+    model = (ByteLatentTransformer(cfg, extra["src_ent"], extra["tgt_ent"])
+             if is_blt else Seq2SeqTransformer(cfg)).to(device)
     total, _ = count_params(model)
     print(f"[{cfg.name}] device={device}  params={total/1e6:.2f}M  "
           f"vocab src={cfg.src_vocab_size} tgt={cfg.tgt_vocab_size}")
 
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg)
-    criterion = nn.CrossEntropyLoss(ignore_index=cfg.pad_id,
-                                    label_smoothing=cfg.label_smoothing)
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=(-100 if is_blt else cfg.pad_id),   # 0 is a real byte in BLT
+        label_smoothing=cfg.label_smoothing)
     # bf16 only where the GPU supports it natively (Ampere+); T4/Turing -> fp32
     use_amp = cfg.bf16 and device == "cuda" and torch.cuda.is_bf16_supported()
 
@@ -149,13 +157,12 @@ def main() -> None:
     while step < cfg.max_steps and not stop:
         train_sampler.set_epoch(epoch)
         epoch += 1
-        for src, tgt in train_loader:
+        for batch in train_loader:
             model.train()
-            src, tgt = src.to(device), tgt.to(device)
             t0 = time.time()
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                loss = compute_loss(model, src, tgt, criterion, is_blt)
+                loss, bsz = compute_loss(model, batch, criterion, is_blt, device)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -170,7 +177,7 @@ def main() -> None:
             step_ema = dt if step_ema is None else 0.9 * step_ema + 0.1 * dt
 
             if step % 20 == 0:
-                n_tok = (tgt[:, 1:] != cfg.pad_id).sum().item()
+                n_tok = int(batch[1].numel())          # target tokens/bytes in the batch
                 log = {
                     "train/loss": loss.item(),
                     "train/lr": scheduler.get_last_lr()[0],
@@ -191,7 +198,7 @@ def main() -> None:
                 preds, refs = generate_predictions(model, val_ds, tgt_tok, cfg, device,
                                                    subset=cfg.eval_subset,
                                                    max_len=cfg.eval_gen_max_len)
-                vm = compute_all_metrics(preds, refs, include_bleu_rouge=True)
+                vm = compute_all_metrics(preds, refs, include_bleu_rouge=not is_blt)
                 history["val_loss"].append((step, vloss))
                 history["val_seq_acc"].append((step, vm["seq_acc"]))
                 print(f"  [eval @ {step}] val_loss {vloss:.4f} | "
@@ -220,7 +227,7 @@ def main() -> None:
     if os.path.exists(ckpt_path):
         model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=False)["model"])
     preds, refs = generate_predictions(model, test_ds, tgt_tok, cfg, device, reassemble=True)
-    test_m = compute_all_metrics(preds, refs, include_bleu_rouge=True)
+    test_m = compute_all_metrics(preds, refs, include_bleu_rouge=not is_blt)
     test_m["peak_mem_mb"] = peak_gpu_mem_mb(device)
     test_m["step_time_ms"] = (step_ema or 0.0) * 1e3
     print(f"[{cfg.name}] TEST: " + " ".join(f"{k}={v:.3f}" for k, v in test_m.items()))
