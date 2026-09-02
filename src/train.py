@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 
 from .config import get_config
 from .dataset import TokenBudgetSampler, collate_seq2seq, make_datasets
+from .models.blt import ByteLatentTransformer
 from .models.transformer import Seq2SeqTransformer
 from .utils import (
     build_scheduler,
@@ -57,15 +58,23 @@ def build_optimizer(model: nn.Module, cfg) -> torch.optim.Optimizer:
     )
 
 
+def compute_loss(model, src, tgt, criterion, is_blt: bool):
+    """C1-C4: token-level teacher forcing. C5/BLT: model returns (byte_logits,
+    labels) already patch-aligned, so no shift here."""
+    if is_blt:
+        logits, labels = model(src, tgt)
+    else:
+        logits, labels = model(src, tgt[:, :-1]), tgt[:, 1:]
+    return criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+
+
 @torch.no_grad()
-def val_loss(model, loader, criterion, device, vocab) -> float:
+def val_loss(model, loader, criterion, device, is_blt: bool) -> float:
     model.eval()
     tot, n = 0.0, 0
     for src, tgt in loader:
         src, tgt = src.to(device), tgt.to(device)
-        logits = model(src, tgt[:, :-1])
-        loss = criterion(logits.reshape(-1, vocab), tgt[:, 1:].reshape(-1))
-        tot += loss.item() * src.size(0)
+        tot += compute_loss(model, src, tgt, criterion, is_blt).item() * src.size(0)
         n += src.size(0)
     return tot / max(n, 1)
 
@@ -81,8 +90,6 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = get_config(args.config)
-    if args.config == "C5":
-        raise SystemExit("C5 (BLT) trains via src/train_blt.py once blt.py is wired.")
     if args.max_steps:
         cfg = replace(cfg, max_steps=args.max_steps)
     if args.batch_size:
@@ -111,7 +118,8 @@ def main() -> None:
                             collate_fn=collate_seq2seq, num_workers=cfg.num_workers)
 
     # --- model / optim ---
-    model = Seq2SeqTransformer(cfg).to(device)
+    is_blt = cfg.tokenization == "blt"
+    model = (ByteLatentTransformer(cfg) if is_blt else Seq2SeqTransformer(cfg)).to(device)
     total, _ = count_params(model)
     print(f"[{cfg.name}] device={device}  params={total/1e6:.2f}M  "
           f"vocab src={cfg.src_vocab_size} tgt={cfg.tgt_vocab_size}")
@@ -147,9 +155,7 @@ def main() -> None:
             t0 = time.time()
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                logits = model(src, tgt[:, :-1])
-                loss = criterion(logits.reshape(-1, cfg.tgt_vocab_size),
-                                 tgt[:, 1:].reshape(-1))
+                loss = compute_loss(model, src, tgt, criterion, is_blt)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -181,7 +187,7 @@ def main() -> None:
                       f"| {log['perf/step_ms']:.0f} ms/step")
 
             if step % cfg.eval_every == 0 or step == cfg.max_steps:
-                vloss = val_loss(model, val_loader, criterion, device, cfg.tgt_vocab_size)
+                vloss = val_loss(model, val_loader, criterion, device, is_blt)
                 preds, refs = generate_predictions(model, val_ds, tgt_tok, cfg, device,
                                                    subset=cfg.eval_subset,
                                                    max_len=cfg.eval_gen_max_len)
@@ -202,7 +208,7 @@ def main() -> None:
                                os.path.join(cfg.ckpt_dir, f"{cfg.name}.pt"))
                 else:
                     patience += 1
-                    if patience >= cfg.early_stop_patience:
+                    if step >= cfg.min_steps and patience >= cfg.early_stop_patience:
                         print(f"  early stop: no val gain (seq_acc/loss) in {patience} evals")
                         stop = True
 
@@ -213,7 +219,7 @@ def main() -> None:
     ckpt_path = os.path.join(cfg.ckpt_dir, f"{cfg.name}.pt")
     if os.path.exists(ckpt_path):
         model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=False)["model"])
-    preds, refs = generate_predictions(model, test_ds, tgt_tok, cfg, device)
+    preds, refs = generate_predictions(model, test_ds, tgt_tok, cfg, device, reassemble=True)
     test_m = compute_all_metrics(preds, refs, include_bleu_rouge=True)
     test_m["peak_mem_mb"] = peak_gpu_mem_mb(device)
     test_m["step_time_ms"] = (step_ema or 0.0) * 1e3

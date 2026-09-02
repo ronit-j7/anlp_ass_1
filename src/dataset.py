@@ -289,12 +289,14 @@ class Tokenizer:
             ids = [BOS_ID] + ids + [EOS_ID]
         return ids
 
-    def decode(self, ids: Sequence[int]) -> str:
+    def decode(self, ids: Sequence[int], strip: bool = True) -> str:
         specials = {PAD_ID, BOS_ID, EOS_ID}
         syms = [self.itos[i] for i in ids if 0 <= i < len(self.itos) and i not in specials]
         text = "".join("" if s == "<unk>" else s for s in syms)
         if self.kind == "plain":
-            text = text.replace("</w>", " ").strip()
+            text = text.replace("</w>", " ")
+            if strip:  # keep boundary spaces when reassembling chunks
+                text = text.strip()
         return text
 
     # ---- persistence ----
@@ -328,6 +330,35 @@ class Tokenizer:
         return cls(bpe, d["itos"], kind)
 
 
+class ByteCodec:
+    """Token-free codec for C5/BLT. Same interface as Tokenizer (vocab_size,
+    encode, decode) so datasets and generate_predictions treat it identically.
+    ids: 0..3 = <pad>/<bos>/<eos>/<unk>; byte value v -> id v+4 (vocab 260)."""
+
+    OFF = len(SPECIALS)  # 4
+
+    def __init__(self, kind: str):
+        assert kind in ("cipher", "plain")
+        self.kind = kind
+        self.vocab_size = 256 + self.OFF
+
+    def encode(self, text: str, add_bos_eos: bool = True) -> List[int]:
+        if self.kind == "cipher":                       # text is a "0"/"1" string
+            assert len(text) % 8 == 0
+            vals = [int(text[i:i + 8], 2) for i in range(0, len(text), 8)]
+        else:                                           # plaintext (ASCII: A-Za-z space)
+            vals = [ord(c) & 0xFF for c in text]
+        ids = [v + self.OFF for v in vals]
+        return [BOS_ID] + ids + [EOS_ID] if add_bos_eos else ids
+
+    def decode(self, ids: Sequence[int], strip: bool = True) -> str:
+        vals = [i - self.OFF for i in ids if i >= self.OFF]
+        if self.kind == "cipher":
+            return "".join(f"{v:08b}" for v in vals)
+        text = "".join(chr(v) for v in vals if 0 <= v < 256)
+        return text.strip() if strip else text
+
+
 # =============================================================================
 # encoded dataset + collation
 # =============================================================================
@@ -341,9 +372,13 @@ class Seq2SeqDataset(Dataset):
         tgt_ids: List[List[int]],
         src_text: List[str],
         tgt_text: List[str],
+        group_id: Optional[List[int]] = None,   # chunk -> index of its source line
+        line_text: Optional[List[str]] = None,  # full plaintext per group_id (for reassembly)
     ):
         self.src_ids, self.tgt_ids = src_ids, tgt_ids
         self.src_text, self.tgt_text = src_text, tgt_text
+        self.group_id = group_id if group_id is not None else list(range(len(src_ids)))
+        self.line_text = line_text if line_text is not None else list(tgt_text)
 
     def __len__(self) -> int:
         return len(self.src_ids)
@@ -465,13 +500,23 @@ def _encoded_cache_path(cfg: Config) -> str:
     key = "|".join(
         str(x)
         for x in (
-            cfg.cipher_file, cfg.plain_file, cfg.src_merge_ops, cfg.tgt_merge_ops,
-            cfg.max_src_len, cfg.max_tgt_len, cfg.seed, cfg.n_val, cfg.n_test,
-            _CIPHER_BPE_TRAIN_LINES,
+            cfg.tokenization, cfg.cipher_file, cfg.plain_file,
+            cfg.src_merge_ops, cfg.tgt_merge_ops,
+            cfg.max_src_len, cfg.max_tgt_len, cfg.chunk_chars, cfg.seed,
+            cfg.n_val, cfg.n_test, _CIPHER_BPE_TRAIN_LINES,
         )
     )
     h = hashlib.sha1(key.encode()).hexdigest()[:12]
     return os.path.join(cfg.tokenizer_dir, f"encoded_{h}.pt")
+
+
+def _chunk_line(cipher: str, plain: str, w: int):
+    """Split one aligned (cipher, plain) pair into windows of `w` plaintext chars
+    (= w*8 cipher bits). `w % 8 == 0` guarantees every window starts at cipher
+    phase 0. Returns [] -> [(cipher, plain)] when w <= 0."""
+    if w <= 0:
+        return [(cipher, plain)]
+    return [(cipher[k * 8:(k + w) * 8], plain[k:k + w]) for k in range(0, len(plain), w)]
 
 
 def make_datasets(cfg: Config):
@@ -484,11 +529,16 @@ def make_datasets(cfg: Config):
     cipher, plain = read_pairs(cfg)
     tr, va, te = split_indices(len(cipher), cfg.n_val, cfg.n_test, cfg.seed)
 
-    src_tok, tgt_tok = build_or_load_tokenizers(
-        cfg, [cipher[i] for i in tr], [plain[i] for i in tr]
-    )
+    if cfg.tokenization == "blt":
+        src_tok, tgt_tok = ByteCodec("cipher"), ByteCodec("plain")
+        print(f"[tok] BLT byte codec  vocab={src_tok.vocab_size}")
+    else:
+        src_tok, tgt_tok = build_or_load_tokenizers(
+            cfg, [cipher[i] for i in tr], [plain[i] for i in tr]
+        )
 
     cache_path = _encoded_cache_path(cfg)
+    _FIELDS = ("src_ids", "tgt_ids", "src_text", "tgt_text", "group_id", "line_text")
     if os.path.exists(cache_path):
         blob = torch.load(cache_path)
         print(f"[data] loaded encoded splits from {cache_path}")
@@ -496,43 +546,36 @@ def make_datasets(cfg: Config):
         return ds["train"], ds["val"], ds["test"], src_tok, tgt_tok
 
     def encode_split(indices, split_name: str, drop_over_cap: bool):
-        s_ids, t_ids, s_txt, t_txt = [], [], [], []
+        s_ids, t_ids, s_txt, t_txt, gid, ltext = [], [], [], [], [], []
         s_len, t_len = [], []
         dropped = 0
         for i in indices:
-            si = src_tok.encode(cipher[i])
-            ti = tgt_tok.encode(plain[i])
-            s_len.append(len(si))
-            t_len.append(len(ti))
-            if len(si) > cfg.max_src_len or len(ti) > cfg.max_tgt_len:
-                if drop_over_cap:
-                    dropped += 1
-                    continue
-                si = si[: cfg.max_src_len]
-                ti = ti[: cfg.max_tgt_len]
-            s_ids.append(si)
-            t_ids.append(ti)
-            s_txt.append(cipher[i])
-            t_txt.append(plain[i])
+            g = len(ltext)                         # group index for this source line
+            ltext.append(plain[i])
+            for cc, pc in _chunk_line(cipher[i], plain[i], cfg.chunk_chars):
+                si, ti = src_tok.encode(cc), tgt_tok.encode(pc)
+                s_len.append(len(si)); t_len.append(len(ti))
+                if len(si) > cfg.max_src_len or len(ti) > cfg.max_tgt_len:
+                    if drop_over_cap:
+                        dropped += 1
+                        continue
+                    si, ti = si[: cfg.max_src_len], ti[: cfg.max_tgt_len]
+                s_ids.append(si); t_ids.append(ti)
+                s_txt.append(cc); t_txt.append(pc); gid.append(g)
         print(
-            f"[data] {split_name:5s} n={len(indices):4d}  "
+            f"[data] {split_name:5s} lines={len(indices):4d} chunks={len(s_ids):5d}  "
             f"src_tok[{_percentiles(s_len)}]  tgt_tok[{_percentiles(t_len)}]  "
             f"dropped_over_cap={dropped}"
         )
-        return Seq2SeqDataset(s_ids, t_ids, s_txt, t_txt)
+        return Seq2SeqDataset(s_ids, t_ids, s_txt, t_txt, gid, ltext)
 
     train_ds = encode_split(tr, "train", drop_over_cap=True)
     val_ds = encode_split(va, "val", drop_over_cap=True)
-    test_ds = encode_split(te, "test", drop_over_cap=False)   # keep every test example
+    test_ds = encode_split(te, "test", drop_over_cap=False)   # keep every test chunk
 
     torch.save(
-        {
-            name: {
-                "src_ids": d.src_ids, "tgt_ids": d.tgt_ids,
-                "src_text": d.src_text, "tgt_text": d.tgt_text,
-            }
-            for name, d in (("train", train_ds), ("val", val_ds), ("test", test_ds))
-        },
+        {name: {f: getattr(d, f) for f in _FIELDS}
+         for name, d in (("train", train_ds), ("val", val_ds), ("test", test_ds))},
         cache_path,
     )
     print(f"[data] cached encoded splits -> {cache_path}")

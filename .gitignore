@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+wandb/
+checkpoints/
+outputs/
+tokenizers/encoded_*.pt
+_*.py
+_*.log

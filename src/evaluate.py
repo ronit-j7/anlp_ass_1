@@ -21,6 +21,7 @@ import torch
 
 from .config import Config
 from .dataset import make_datasets
+from .models.blt import ByteLatentTransformer
 from .models.transformer import Seq2SeqTransformer
 from .utils import (
     compute_all_metrics,
@@ -47,12 +48,14 @@ def evaluate_one(name: str, split: str, ckpt_path: str, device_pref: str) -> dic
     train_ds, val_ds, test_ds, _src_tok, tgt_tok = make_datasets(cfg)
     ds = {"train": train_ds, "val": val_ds, "test": test_ds}[split]
 
-    model = Seq2SeqTransformer(cfg).to(device)
+    is_blt = cfg.tokenization == "blt"
+    model = (ByteLatentTransformer(cfg) if is_blt else Seq2SeqTransformer(cfg)).to(device)
     model.load_state_dict(ckpt["model"])
 
     reset_peak_gpu_mem(device)
     t0 = time.time()
-    preds, refs = generate_predictions(model, ds, tgt_tok, cfg, device)
+    preds, refs = generate_predictions(model, ds, tgt_tok, cfg, device,
+                                       reassemble=(getattr(cfg, "chunk_chars", 0) > 0))
     dt = time.time() - t0
 
     m = compute_all_metrics(preds, refs, include_bleu_rouge=(cfg.tokenization == "subword"))

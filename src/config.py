@@ -34,20 +34,26 @@ class Config:
     tokenization: str = "subword"        # "subword" | "blt"
 
     # --- model width / depth (shared across all configs) ---
-    d_model: int = 256
-    n_layers: int = 4                    # same count for encoder and decoder
-    n_heads: int = 8
+    d_model: int = 192                   # a 1.6M model already fit the map; 4.5M has headroom
+    n_layers: int = 3                    # same count for encoder and decoder
+    n_heads: int = 6
     n_kv_heads: int = 2                  # only consulted when attention == "gqa"
-    d_ff: int = 1024
+    d_ff: int = 768
     dropout: float = 0.1
 
     # --- tokenizer / sequence (shared) ---
     src_merge_ops: int = 3000            # byte-level BPE on the cipher (see dataset.py header)
     tgt_merge_ops: int = 4000            # word-level BPE on the plaintext
     patch_size: int = 4                  # BLT only (C5): bytes per patch
-    max_src_len: int = 1536             # src token p100=1164 -> nothing dropped
-    max_tgt_len: int = 768             # covers tgt p99=693 (~1% of train dropped); over-cap
-                                        # lines are dropped in train, truncated in eval
+    chunk_chars: int = 256              # split each line into windows of this many PLAINTEXT
+                                        # chars BEFORE tokenizing (0 = whole line). Must be a
+                                        # multiple of 8: then every chunk starts at cipher phase
+                                        # 0, so phase == (local position mod 8) -- directly
+                                        # available from the positional encoding instead of
+                                        # something the model must count across the whole line.
+                                        # Also ~2.7x more, shorter training pairs.
+    max_src_len: int = 384             # a 256-char chunk BPE-encodes well under this
+    max_tgt_len: int = 384             # over-cap chunks: dropped in train, truncated in eval
     src_vocab_size: Optional[int] = None
     tgt_vocab_size: Optional[int] = None
     pad_id: int = PAD_ID
@@ -57,14 +63,16 @@ class Config:
 
     # --- optimization (shared) ---
     batch_size: int = 32                # nominal; real batching is token-budget (see max_tokens)
-    max_tokens: int = 6144              # cap on (rows * padded_len) per train/val batch, so a
+    max_tokens: int = 12288            # cap on (rows * padded_len) per train/val batch, so a
                                         # long example -> fewer rows. Attention here is O(B*T^2)
                                         # (no flash-attn), so this is what bounds GPU memory.
     eval_batch_size: int = 16          # greedy decode is autoregressive; keep this modest
-    lr: float = 3e-4                     # peak LR after warmup
-    lr_schedule: str = "inverse_sqrt"   # "inverse_sqrt" | "cosine"
-    warmup_steps: int = 500
-    max_steps: int = 8000               # ceiling; early stopping usually ends sooner
+    lr: float = 5e-4                     # peak LR after warmup
+    lr_schedule: str = "cosine"         # "cosine" | "inverse_sqrt"  (cosine holds LR high longer,
+                                        #   which the mapping needs to "click" -- see notes)
+    warmup_steps: int = 800
+    max_steps: int = 12000             # with phase-aligned chunking the click comes much sooner
+    min_steps: int = 3000              # early stopping cannot fire before this
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     label_smoothing: float = 0.1
@@ -73,11 +81,10 @@ class Config:
     bf16: bool = True
 
     # --- eval / logging (shared) ---
-    eval_every: int = 500
-    eval_subset: int = 128              # greedy-decode this many val examples per eval
-    eval_gen_max_len: int = 320        # cap decode length in PERIODIC eval (final test uses
-                                        # gen_max_len); greedy w/o KV cache is O(len^2)
-    early_stop_patience: int = 6       # consecutive evals w/o val gain (seq_acc, then loss)
+    eval_every: int = 1000
+    eval_subset: int = 128              # greedy-decode this many val chunks per eval
+    eval_gen_max_len: int = 384        # chunks are short now, so decode them in full
+    early_stop_patience: int = 8       # consecutive evals w/o val gain (seq_acc, then loss)
     seed: int = 42
     wandb_project: str = "anlp-a1-transformers"
 

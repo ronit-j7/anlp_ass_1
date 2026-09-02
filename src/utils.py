@@ -174,13 +174,19 @@ def generate_predictions(
     subset: Optional[int] = None,
     batch_size: Optional[int] = None,
     max_len: Optional[int] = None,
+    reassemble: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """Greedy-decode `subset` (or all) examples of `dataset`; return (preds, refs)."""
+    """Greedy-decode `subset` (or all) rows of `dataset`; return (preds, refs).
+
+    reassemble=True: rows are chunks -- join each source line's chunks back into
+    one string and compare against the full line (dataset.line_text). Use for the
+    final test metrics. Periodic val eval leaves it False (chunk-level proxy)."""
     model.eval()
     n = len(dataset) if subset is None else min(subset, len(dataset))
     bs = batch_size or getattr(cfg, "eval_batch_size", 16)
     gen_len = max_len or cfg.gen_max_len
-    preds: List[str] = []
+    keep_space = reassemble
+    chunks: List[str] = []
     for start in range(0, n, bs):
         rows = list(range(start, min(start + bs, n)))
         smax = max(len(dataset.src_ids[i]) for i in rows)
@@ -191,8 +197,27 @@ def generate_predictions(
         gen = model.generate(src.to(device), max_len=gen_len)  # (B, L)
         for row in gen.tolist():
             body = cut_at_eos(row[1:], cfg.eos_id)  # drop BOS, stop at EOS
-            preds.append(tgt_tok.decode(body))
-    refs = [dataset.tgt_text[i] for i in range(n)]
+            chunks.append(tgt_tok.decode(body, strip=not keep_space))
+
+    if not reassemble:
+        return chunks, [dataset.tgt_text[i] for i in range(n)]
+
+    preds: List[str] = []
+    order: List[int] = []
+    buf: List[str] = []
+    prev = None
+    for i in range(n):
+        g = dataset.group_id[i]
+        if prev is not None and g != prev:
+            preds.append(" ".join("".join(buf).split()))
+            order.append(prev)
+            buf = []
+        buf.append(chunks[i])
+        prev = g
+    if buf:
+        preds.append(" ".join("".join(buf).split()))
+        order.append(prev)
+    refs = [dataset.line_text[g] for g in order]
     return preds, refs
 
 
