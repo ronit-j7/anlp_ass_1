@@ -92,6 +92,8 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--ckpt-dir", default=None, help="override; point at Drive to survive a reclaim")
+    ap.add_argument("--resume", action="store_true", help="continue from <config>_last.pt if present")
     args = ap.parse_args()
 
     cfg = get_config(args.config)
@@ -101,6 +103,8 @@ def main() -> None:
         cfg = replace(cfg, batch_size=args.batch_size)
     if args.seed is not None:
         cfg = replace(cfg, seed=args.seed)
+    if args.ckpt_dir:
+        cfg = replace(cfg, ckpt_dir=args.ckpt_dir)
 
     device = pick_device(args.device)
     set_seed(cfg.seed)
@@ -153,6 +157,18 @@ def main() -> None:
     reset_peak_gpu_mem(device)
     stop = False
     epoch = 0
+
+    last_path = os.path.join(cfg.ckpt_dir, f"{cfg.name}_last.pt")
+    if args.resume and os.path.exists(last_path):
+        ck = torch.load(last_path, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        scheduler.load_state_dict(ck["scheduler"])
+        step, epoch = ck["step"], ck["epoch"]
+        best_score, best_seq_acc, patience = ck["best_score"], ck["best_seq_acc"], ck["patience"]
+        history = ck["history"]
+        torch.manual_seed(cfg.seed + step)   # fresh but deterministic-ish stream after resume
+        print(f"[{cfg.name}] resumed from {last_path} at step {step}")
 
     while step < cfg.max_steps and not stop:
         train_sampler.set_epoch(epoch)
@@ -218,6 +234,14 @@ def main() -> None:
                     if step >= cfg.min_steps and patience >= cfg.early_stop_patience:
                         print(f"  early stop: no val gain (seq_acc/loss) in {patience} evals")
                         stop = True
+
+                # full training state for --resume (survives a Colab reclaim if
+                # ckpt_dir points at Drive)
+                torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(), "cfg": asdict(cfg),
+                            "step": step, "epoch": epoch, "best_score": best_score,
+                            "best_seq_acc": best_seq_acc, "patience": patience,
+                            "history": history}, last_path)
 
             if step >= cfg.max_steps or stop:
                 break
